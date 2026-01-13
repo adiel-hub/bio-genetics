@@ -480,6 +480,131 @@ def relay_pverify_mbi_lookup():
 
 
 # ============================================================
+# MBI VALIDATION
+# ============================================================
+
+def validate_mbi(mbi: str) -> dict:
+    """Validate Medicare Beneficiary ID (MBI) format
+
+    MBI Format: 11 characters (dashes are for display only)
+    - Position 1: Number 1-9 (not 0)
+    - Position 2, 5, 8, 9: Letters A-Z (excluding S,L,O,I,B,Z)
+    - Position 3, 6: Number 0-9 or Letter (excluding S,L,O,I,B,Z)
+    - Position 4, 7, 10, 11: Number 0-9
+
+    Example: 1EG4-TE5-MK73 (dashes for display only)
+
+    Args:
+        mbi: The Medicare Beneficiary ID to validate
+
+    Returns:
+        dict with 'valid' boolean, 'mbi' (cleaned), and 'errors' list if invalid
+    """
+    if not mbi:
+        return {"valid": False, "error": "MBI is required", "errors": []}
+
+    # Clean MBI: uppercase and remove dashes/spaces
+    mbi_clean = mbi.upper().replace('-', '').replace(' ', '')
+
+    if len(mbi_clean) != 11:
+        return {
+            "valid": False,
+            "error": f"MBI must be exactly 11 characters, got {len(mbi_clean)}",
+            "mbi": mbi_clean,
+            "errors": []
+        }
+
+    # Valid characters by position type
+    C = "123456789"             # Position 1 (1-9, no 0)
+    N = "0123456789"            # Numbers 0-9
+    A = "ACDEFGHJKMNPQRTUVWXY"  # Letters (excluding S,L,O,I,B,Z)
+    AN = A + N                  # Alphanumeric
+
+    # Position rules (1-indexed for clarity)
+    position_rules = {
+        1: (C, "number 1-9"),
+        2: (A, "letter"),
+        3: (AN, "letter or number"),
+        4: (N, "number"),
+        5: (A, "letter"),
+        6: (AN, "letter or number"),
+        7: (N, "number"),
+        8: (A, "letter"),
+        9: (A, "letter"),
+        10: (N, "number"),
+        11: (N, "number")
+    }
+
+    errors = []
+    for pos, (valid_chars, expected_desc) in position_rules.items():
+        char = mbi_clean[pos - 1]
+        if char not in valid_chars:
+            errors.append({
+                "position": pos,
+                "character": char,
+                "expected": expected_desc
+            })
+
+    return {
+        "valid": len(errors) == 0,
+        "mbi": mbi_clean,
+        "errors": errors
+    }
+
+
+@app.route('/relay/mbi/validate', methods=['POST'])
+def relay_mbi_validate():
+    """Validate Medicare Beneficiary ID (MBI) format in real-time
+
+    MBI Format: 11 characters (example: 1EG4-TE5-MK73)
+    - Position 1: Number 1-9 (not 0)
+    - Position 2, 5, 8, 9: Letters A-Z (excluding S,L,O,I,B,Z)
+    - Position 3, 6: Number 0-9 or Letter
+    - Position 4, 7, 10, 11: Number 0-9
+
+    Request body:
+    {
+        "mbi": "1EG4TE5MK73"  // or "1EG4-TE5-MK73" (dashes ignored)
+    }
+
+    Response (valid):
+    {
+        "valid": true,
+        "mbi": "1EG4TE5MK73"
+    }
+
+    Response (invalid):
+    {
+        "valid": false,
+        "mbi": "0EG4TE5MK73",
+        "errors": [
+            {"position": 1, "character": "0", "expected": "number 1-9"}
+        ]
+    }
+    """
+    auth_header = request.headers.get('X-Relay-Key')
+    if auth_header != RELAY_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json() or {}
+    mbi = data.get('mbi', '')
+
+    # Log request (mask middle characters for privacy)
+    mbi_display = mbi[:3] + '***' + mbi[-2:] if len(mbi) >= 5 else '***'
+    print(f"[MBI Validate] Validating: {mbi_display}")
+
+    result = validate_mbi(mbi)
+
+    # Log result
+    if result['valid']:
+        print(f"[MBI Validate] Valid MBI")
+    else:
+        print(f"[MBI Validate] Invalid MBI - Errors: {result.get('errors', [])}")
+
+    return jsonify(result), 200
+
+
+# ============================================================
 # VICIDIAL RELAY ENDPOINTS
 # ============================================================
 
@@ -871,6 +996,65 @@ def relay_vicidial_transfer():
 
     response_text, status_code = vicidial_request('agent', params)
     result = parse_vicidial_response(response_text)
+    return jsonify(result), 200 if result.get('success') else 400
+
+
+@app.route('/relay/vicidial/transfer-to-agent', methods=['POST'])
+def relay_vicidial_transfer_to_agent():
+    """Transfer call to a live VICIdial agent using INTERNAL_TRANSFER in-group
+
+    This endpoint is used by VAPI to transfer qualified patients back to a
+    human sales agent. It uses the LOCAL_CLOSER method with the INTERNAL_TRANSFER
+    in-group configured in VICIdial.
+
+    Request body:
+    {
+        "destination": "sales",           // optional, for logging/routing context
+        "ingroup": "INTERNAL_TRANSFER"    // optional, defaults to INTERNAL_TRANSFER
+    }
+
+    Response:
+    {
+        "success": true,
+        "message": "SUCCESS: transfer_conference function set..."
+    }
+
+    Error Response:
+    {
+        "success": false,
+        "error": "ERROR: agent_user does not have a live call..."
+    }
+
+    Notes:
+    - Agent must be logged in and have a live call for transfer to work
+    - The INTERNAL_TRANSFER in-group must be configured in VICIdial campaign
+    - Uses LOCAL_CLOSER to route to available agents in the same campaign
+    """
+    auth_header = request.headers.get('X-Relay-Key')
+    if auth_header != RELAY_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json() or {}
+
+    destination = data.get('destination', 'sales')
+    ingroup = data.get('ingroup', 'INTERNAL_TRANSFER')
+
+    # Log request
+    print(f"[VICIdial Transfer to Agent] Destination: {destination} | In-Group: {ingroup}")
+
+    params = {
+        'function': 'transfer_conference',
+        'value': 'LOCAL_CLOSER',
+        'ingroup_choices': ingroup
+    }
+
+    response_text, status_code = vicidial_request('agent', params)
+    result = parse_vicidial_response(response_text)
+
+    # Add destination context to response
+    result['destination'] = destination
+    result['ingroup'] = ingroup
+
     return jsonify(result), 200 if result.get('success') else 400
 
 
@@ -1568,7 +1752,7 @@ def home():
     """Home endpoint with API info"""
     return jsonify({
         "name": "BioGenetics API Relay Server",
-        "version": "1.5",
+        "version": "1.7",
         "endpoints": {
             "health": "GET /health",
             "emdeon_token": "POST /relay/emdeon/token",
@@ -1583,6 +1767,7 @@ def home():
             "pverify_token": "POST /relay/pverify/token",
             "pverify_mbi_inquiry": "POST /relay/pverify/mbi-inquiry (with access_token)",
             "pverify_mbi_lookup": "POST /relay/pverify/mbi-lookup (combined: token + lookup)",
+            "mbi_validate": "POST /relay/mbi/validate (real-time MBI format validation)",
             "vicidial_add_lead": "POST /relay/vicidial/add-lead (triggers auto-dial)",
             "vicidial_delete_lead": "POST /relay/vicidial/delete-lead (by lead_id or phone)",
             "vicidial_lead_info": "POST /relay/vicidial/lead-info (get lead by phone)",
@@ -1591,6 +1776,7 @@ def home():
             "vicidial_agent_status": "POST /relay/vicidial/agent-status",
             "vicidial_dial": "POST /relay/vicidial/dial (phone_number or lead_id)",
             "vicidial_transfer": "POST /relay/vicidial/transfer (to VAPI or other)",
+            "vicidial_transfer_to_agent": "POST /relay/vicidial/transfer-to-agent (LOCAL_CLOSER to INTERNAL_TRANSFER)",
             "vicidial_hangup": "POST /relay/vicidial/hangup",
             "vicidial_disposition": "POST /relay/vicidial/disposition (status code)",
             "vicidial_pause": "POST /relay/vicidial/pause (PAUSE or RESUME)",
@@ -1601,7 +1787,7 @@ def home():
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("  BioGenetics API Relay Server v1.6")
+    print("  BioGenetics API Relay Server v1.7")
     print("=" * 50)
     print(f"\nRelay API Key: {RELAY_API_KEY}")
     print("\nStarting server on http://0.0.0.0:5001")
