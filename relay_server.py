@@ -1037,7 +1037,7 @@ def relay_vicidial_transfer_to_agent():
     data = request.get_json() or {}
 
     destination = data.get('destination', 'sales')
-    ingroup = data.get('ingroup', 'INTERNAL_TRANSFER')
+    ingroup = data.get('ingroup', 'DEFAULTINGROUP')
 
     # Log request
     print(f"[VICIdial Transfer to Agent] Destination: {destination} | In-Group: {ingroup}")
