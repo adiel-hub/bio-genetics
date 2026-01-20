@@ -624,127 +624,6 @@ VICIDIAL_CONFIG = {
 }
 
 
-# ============================================================
-# VICIDIAL SESSION CLASS - Automated Login
-# ============================================================
-
-import re
-
-class VicidialSession:
-    """
-    Manages automated VICIdial agent login and API calls.
-    Maintains session cookies for authenticated API access.
-    """
-
-    def __init__(self, config=None):
-        self.config = config or VICIDIAL_CONFIG.copy()
-        self.session = requests.Session()
-        self.logged_in = False
-        self.session_id = None
-
-    def login(self, campaign=None, phone_login=None, phone_pass=None,
-              agent_user=None, agent_pass=None):
-        """
-        Automate the VICIdial login process via HTTP POST.
-
-        VICIdial login has two steps:
-        1. Phone login: POST with phone_login, phone_pass
-        2. Agent login: POST with VD_login, VD_pass, VD_campaign
-        """
-        phone_login = phone_login or self.config['phone_login']
-        phone_pass = phone_pass or self.config['phone_pass']
-        agent_user = agent_user or self.config['agent_user']
-        agent_pass = agent_pass or self.config['pass']
-        campaign = campaign or self.config.get('campaign')
-
-        if not campaign:
-            return {'success': False, 'error': 'Campaign name is required for login'}
-
-        base_url = self.config['base_url']
-        vicidial_url = f"{base_url}{self.config['vicidial_php']}"
-
-        try:
-            # Step 1: Phone Login
-            phone_data = {
-                'phone_login': phone_login,
-                'phone_pass': phone_pass,
-                'SUBMIT': 'SUBMIT'
-            }
-
-            resp1 = self.session.post(vicidial_url, data=phone_data, timeout=30)
-
-            if 'ERROR' in resp1.text or 'Invalid' in resp1.text:
-                return {
-                    'success': False,
-                    'error': f'Phone login failed: {resp1.text[:200]}'
-                }
-
-            # Step 2: Agent Login
-            agent_data = {
-                'VD_login': agent_user,
-                'VD_pass': agent_pass,
-                'VD_campaign': campaign,
-                'SUBMIT': 'SUBMIT'
-            }
-
-            resp2 = self.session.post(vicidial_url, data=agent_data, timeout=30)
-
-            if 'ERROR' in resp2.text or 'Invalid' in resp2.text:
-                return {
-                    'success': False,
-                    'error': f'Agent login failed: {resp2.text[:200]}'
-                }
-
-            # Extract session info if available
-            session_match = re.search(r'session_id["\s:=]+([A-Za-z0-9]+)', resp2.text)
-            if session_match:
-                self.session_id = session_match.group(1)
-
-            self.logged_in = True
-
-            return {
-                'success': True,
-                'message': 'Agent logged in successfully',
-                'session_id': self.session_id,
-                'cookies': dict(self.session.cookies)
-            }
-
-        except requests.exceptions.RequestException as e:
-            return {'success': False, 'error': f'Login request failed: {str(e)}'}
-
-    def api_request(self, function, params=None):
-        """Make an Agent API request using the authenticated session."""
-        params = params or {}
-
-        base_params = {
-            'source': 'API',
-            'user': self.config['user'],
-            'pass': self.config['pass'],
-            'agent_user': self.config['agent_user'],
-            'function': function
-        }
-        base_params.update(params)
-
-        url = f"{self.config['base_url']}{self.config['agent_api']}"
-
-        try:
-            response = self.session.get(url, params=base_params, timeout=30)
-            return response.text, response.status_code
-        except requests.exceptions.RequestException as e:
-            return f"ERROR: {str(e)}", 500
-
-
-# Global session store for managing multiple agent sessions
-_vicidial_sessions = {}
-
-
-def get_vicidial_session(session_key='default'):
-    """Get or create a VicidialSession instance."""
-    if session_key not in _vicidial_sessions:
-        _vicidial_sessions[session_key] = VicidialSession()
-    return _vicidial_sessions[session_key]
-
-
 def vicidial_request(api_type, params):
     """Make a request to VICIdial API
 
@@ -799,206 +678,6 @@ def parse_vicidial_response(response_text):
         return {'success': True, 'raw': response_text}
 
 
-@app.route('/relay/vicidial/login', methods=['POST'])
-def relay_vicidial_login():
-    """Auto-login agent via HTTP POST to VICIdial web interface
-
-    This endpoint simulates the VICIdial web login process, allowing
-    the agent to be "logged in" without manually using the web interface.
-
-    Request body:
-    {
-        "campaign": "CAMPAIGN_NAME",  // REQUIRED: Campaign to log into
-        "phone_login": "8100",        // optional, defaults to config
-        "phone_pass": "810081008100", // optional, defaults to config
-        "agent_user": "8100",         // optional, defaults to config
-        "agent_pass": "810081008100", // optional, defaults to config
-        "session_key": "default"      // optional, for managing multiple sessions
-    }
-
-    Response:
-    {
-        "success": true,
-        "message": "Agent logged in successfully",
-        "session_id": "abc123"
-    }
-    """
-    auth_header = request.headers.get('X-Relay-Key')
-    if auth_header != RELAY_API_KEY:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    data = request.get_json() or {}
-
-    campaign = data.get('campaign')
-    if not campaign:
-        return jsonify({"error": "campaign is required"}), 400
-
-    # Log request
-    print(f"[VICIdial Login] Campaign: {campaign} | Agent: {data.get('agent_user', VICIDIAL_CONFIG['user'])}")
-
-    session_key = data.get('session_key', 'default')
-    session = get_vicidial_session(session_key)
-
-    result = session.login(
-        campaign=campaign,
-        phone_login=data.get('phone_login'),
-        phone_pass=data.get('phone_pass'),
-        agent_user=data.get('agent_user'),
-        agent_pass=data.get('agent_pass')
-    )
-
-    if result.get('success'):
-        return jsonify(result), 200
-    else:
-        return jsonify(result), 400
-
-
-@app.route('/relay/vicidial/logout', methods=['POST'])
-def relay_vicidial_logout():
-    """Logout the agent session
-
-    Request body:
-    {
-        "session_key": "default"  // optional
-    }
-
-    Response:
-    {
-        "success": true,
-        "message": "Session cleared"
-    }
-    """
-    auth_header = request.headers.get('X-Relay-Key')
-    if auth_header != RELAY_API_KEY:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    data = request.get_json() or {}
-    session_key = data.get('session_key', 'default')
-
-    # Log request
-    print(f"[VICIdial Logout] Clearing session: {session_key}")
-
-    if session_key in _vicidial_sessions:
-        del _vicidial_sessions[session_key]
-
-    return jsonify({"success": True, "message": "Session cleared"}), 200
-
-
-@app.route('/relay/vicidial/agent-status', methods=['POST'])
-def relay_vicidial_agent_status():
-    """Get VICIdial agent status
-
-    Request body: {} (empty)
-
-    Response:
-    {
-        "success": true,
-        "status": "INCALL|READY|PAUSED",
-        "call_id": "M4050908...",
-        "lead_id": "12345"
-    }
-    """
-    auth_header = request.headers.get('X-Relay-Key')
-    if auth_header != RELAY_API_KEY:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    # Log request
-    print(f"[VICIdial Agent Status] Checking agent status...")
-
-    response_text, status_code = vicidial_request('non_agent', {
-        'function': 'agent_status'
-    })
-
-    result = parse_vicidial_response(response_text)
-    return jsonify(result), 200 if result.get('success') else 400
-
-
-@app.route('/relay/vicidial/dial', methods=['POST'])
-def relay_vicidial_dial():
-    """Dial a phone number or lead
-
-    Request body:
-    {
-        "phone_number": "7275551212",  // optional
-        "lead_id": 12345               // optional - use one or the other
-    }
-
-    Response:
-    {
-        "success": true,
-        "message": "SUCCESS: external_dial function set..."
-    }
-    """
-    auth_header = request.headers.get('X-Relay-Key')
-    if auth_header != RELAY_API_KEY:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    data = request.get_json() or {}
-
-    # Log request
-    dial_target = data.get('lead_id') or data.get('phone_number', 'N/A')
-    print(f"[VICIdial Dial] Dialing: {dial_target}")
-
-    params = {
-        'function': 'external_dial',
-        'phone_code': '1',
-        'search': 'YES',
-        'preview': 'NO',
-        'focus': 'NO'
-    }
-
-    if data.get('lead_id'):
-        params['lead_id'] = data['lead_id']
-    elif data.get('phone_number'):
-        params['value'] = data['phone_number']
-    else:
-        return jsonify({"error": "Either phone_number or lead_id is required"}), 400
-
-    response_text, status_code = vicidial_request('agent', params)
-    result = parse_vicidial_response(response_text)
-    return jsonify(result), 200 if result.get('success') else 400
-
-
-@app.route('/relay/vicidial/transfer', methods=['POST'])
-def relay_vicidial_transfer():
-    """Transfer call to another number (defaults to VAPI)
-
-    Request body:
-    {
-        "phone_number": "972539515792",  // optional, defaults to VAPI
-        "transfer_type": "BLIND_TRANSFER"  // or DIAL_WITH_CUSTOMER, LEAVE_VM
-    }
-
-    Response:
-    {
-        "success": true,
-        "message": "SUCCESS: transfer_conference function set..."
-    }
-    """
-    auth_header = request.headers.get('X-Relay-Key')
-    if auth_header != RELAY_API_KEY:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    data = request.get_json() or {}
-
-    phone_number = data.get('phone_number', VICIDIAL_CONFIG['vapi_phone'])
-    transfer_type = data.get('transfer_type', 'BLIND_TRANSFER')
-
-    # Log request
-    print(f"[VICIdial Transfer] Transferring to: {phone_number} | Type: {transfer_type}")
-
-    params = {
-        'function': 'transfer_conference',
-        'value': transfer_type,
-        'phone_number': phone_number,
-        'dial_override': 'YES'
-    }
-
-    response_text, status_code = vicidial_request('agent', params)
-    result = parse_vicidial_response(response_text)
-    return jsonify(result), 200 if result.get('success') else 400
-
-
 @app.route('/relay/vicidial/transfer-to-agent', methods=['POST'])
 def relay_vicidial_transfer_to_agent():
     """Transfer call to a live VICIdial agent using INTERNAL_TRANSFER in-group
@@ -1037,7 +716,7 @@ def relay_vicidial_transfer_to_agent():
     data = request.get_json() or {}
 
     destination = data.get('destination', 'sales')
-    ingroup = data.get('ingroup', 'DEFAULTINGROUP')
+    ingroup = data.get('ingroup', 'INTERNAL_TRANSFER')
 
     # Log request
     print(f"[VICIdial Transfer to Agent] Destination: {destination} | In-Group: {ingroup}")
@@ -1048,42 +727,47 @@ def relay_vicidial_transfer_to_agent():
         'ingroup_choices': ingroup
     }
 
-    response_text, status_code = vicidial_request('agent', params)
-    result = parse_vicidial_response(response_text)
+    # Try transfer with 1 retry per John's email
+    import time
+    for attempt in range(2):
+        response_text, status_code = vicidial_request('agent', params)
+        result = parse_vicidial_response(response_text)
 
-    # Add destination context to response
-    result['destination'] = destination
-    result['ingroup'] = ingroup
+        # Success - HTTP 200 OK is the only good response per John
+        if result.get('success') and status_code == 200:
+            result['destination'] = destination
+            result['ingroup'] = ingroup
+            result['retry_attempted'] = (attempt > 0)
+            print(f"[VICIdial Transfer to Agent] Success on attempt {attempt + 1}")
+            return jsonify(result), 200
 
-    return jsonify(result), 200 if result.get('success') else 400
+        # First attempt failed - retry once
+        if attempt == 0:
+            print(f"[VICIdial Transfer to Agent] First attempt failed, retrying in 0.5s...")
+            time.sleep(0.5)
+            continue
 
+        # Second attempt also failed - return structured error for Sabrina
+        print(f"[VICIdial Transfer to Agent] Transfer failed after retry")
+        result['destination'] = destination
+        result['ingroup'] = ingroup
+        result['retry_attempted'] = True
+        result['sabrina_action'] = 'TRANSFER_FAILED'
+        result['sabrina_message'] = 'Transfer to agent failed. Inform patient system is down and we will call them back.'
+        result['disposition_code'] = 'CALLBK'
+        return jsonify(result), 500
 
-@app.route('/relay/vicidial/hangup', methods=['POST'])
-def relay_vicidial_hangup():
-    """Hang up the current call
-
-    Request body: {} (empty)
-
-    Response:
-    {
-        "success": true,
-        "message": "SUCCESS: external_hangup function set..."
-    }
-    """
-    auth_header = request.headers.get('X-Relay-Key')
-    if auth_header != RELAY_API_KEY:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    # Log request
-    print(f"[VICIdial Hangup] Hanging up call...")
-
-    response_text, status_code = vicidial_request('agent', {
-        'function': 'external_hangup',
-        'value': '1'
-    })
-
-    result = parse_vicidial_response(response_text)
-    return jsonify(result), 200 if result.get('success') else 400
+    # Fallback (shouldn't reach here)
+    return jsonify({
+        'success': False,
+        'error': 'Transfer failed',
+        'destination': destination,
+        'ingroup': ingroup,
+        'retry_attempted': True,
+        'sabrina_action': 'TRANSFER_FAILED',
+        'sabrina_message': 'Transfer to agent failed. Inform patient system is down and we will call them back.',
+        'disposition_code': 'CALLBK'
+    }), 500
 
 
 @app.route('/relay/vicidial/disposition', methods=['POST'])
@@ -1126,43 +810,6 @@ def relay_vicidial_disposition():
         params['callback_type'] = data['callback_type']
 
     response_text, status_code = vicidial_request('agent', params)
-    result = parse_vicidial_response(response_text)
-    return jsonify(result), 200 if result.get('success') else 400
-
-
-@app.route('/relay/vicidial/pause', methods=['POST'])
-def relay_vicidial_pause():
-    """Pause or resume the agent
-
-    Request body:
-    {
-        "action": "PAUSE"  // or "RESUME"
-    }
-
-    Response:
-    {
-        "success": true,
-        "message": "SUCCESS: external_pause function set..."
-    }
-    """
-    auth_header = request.headers.get('X-Relay-Key')
-    if auth_header != RELAY_API_KEY:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    data = request.get_json() or {}
-    action = data.get('action', 'PAUSE')
-
-    if action not in ['PAUSE', 'RESUME']:
-        return jsonify({"error": "action must be PAUSE or RESUME"}), 400
-
-    # Log request
-    print(f"[VICIdial Pause] Action: {action}")
-
-    response_text, status_code = vicidial_request('agent', {
-        'function': 'external_pause',
-        'value': action
-    })
-
     result = parse_vicidial_response(response_text)
     return jsonify(result), 200 if result.get('success') else 400
 
@@ -1553,137 +1200,6 @@ def relay_vicidial_lead_info():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route('/relay/vicidial/call-vapi', methods=['POST'])
-def relay_vicidial_call_vapi():
-    """Combined: Auto-login (optional) + Dial lead + Transfer to VAPI AI assistant
-
-    This is the main endpoint for making calls via VICIdial and transferring
-    to the VAPI AI voice assistant. Supports auto-login before dialing.
-
-    Request body:
-    {
-        "phone_number": "7275551212",  // optional (use phone_number OR lead_id)
-        "lead_id": 12345,              // optional (use phone_number OR lead_id)
-        "auto_login": true,            // optional: auto-login before dialing
-        "campaign": "CAMPAIGN_NAME",   // required if auto_login is true
-        "wait_time": 2                 // optional: seconds to wait before transfer (default 2)
-    }
-
-    Response:
-    {
-        "success": true,
-        "steps": [
-            {"step": "login", "success": true, "message": "..."},
-            {"step": "dial", "success": true, "message": "..."},
-            {"step": "transfer", "success": true, "message": "..."}
-        ]
-    }
-    """
-    auth_header = request.headers.get('X-Relay-Key')
-    if auth_header != RELAY_API_KEY:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    data = request.get_json() or {}
-    steps = []
-
-    # Log request
-    dial_target = data.get('lead_id') or data.get('phone_number', 'N/A')
-    print(f"[VICIdial Call VAPI] Phone/Lead: {dial_target} | Auto-login: {data.get('auto_login', False)}")
-
-    # Step 0: Auto-login if requested
-    if data.get('auto_login'):
-        campaign = data.get('campaign')
-        if not campaign:
-            return jsonify({"error": "campaign is required when auto_login is true"}), 400
-
-        session = get_vicidial_session('call-vapi')
-        login_result = session.login(campaign=campaign)
-        steps.append({'step': 'login', **login_result})
-
-        if not login_result.get('success'):
-            return jsonify({
-                'success': False,
-                'error': 'Failed to auto-login',
-                'steps': steps
-            }), 400
-
-    # Step 0.5: Pause the agent (required before dialing)
-    pause_response, _ = vicidial_request('agent', {
-        'function': 'external_pause',
-        'value': 'PAUSE'
-    })
-    pause_result = parse_vicidial_response(pause_response)
-    steps.append({'step': 'pause', **pause_result})
-    # Note: We continue even if pause "fails" with "already paused" message
-
-    # Step 1: Dial
-    dial_params = {
-        'function': 'external_dial',
-        'phone_code': '1',
-        'search': 'YES',
-        'preview': 'NO',
-        'focus': 'NO'
-    }
-
-    if data.get('lead_id'):
-        dial_params['lead_id'] = data['lead_id']
-    elif data.get('phone_number'):
-        dial_params['value'] = data['phone_number']
-    else:
-        return jsonify({"error": "Either phone_number or lead_id is required"}), 400
-
-    # Use session if logged in, otherwise use standard request
-    if data.get('auto_login'):
-        session = get_vicidial_session('call-vapi')
-        dial_response, _ = session.api_request('external_dial', {
-            'phone_code': '1',
-            'search': 'YES',
-            'preview': 'NO',
-            'focus': 'NO',
-            'lead_id': data.get('lead_id'),
-            'value': data.get('phone_number')
-        })
-    else:
-        dial_response, _ = vicidial_request('agent', dial_params)
-
-    dial_result = parse_vicidial_response(dial_response)
-    steps.append({'step': 'dial', **dial_result})
-
-    if not dial_result.get('success'):
-        return jsonify({
-            'success': False,
-            'error': 'Failed to dial',
-            'steps': steps
-        }), 400
-
-    # Step 2: Wait for call to connect
-    import time
-    wait_time = data.get('wait_time', 2)
-    time.sleep(wait_time)
-
-    # Step 3: Transfer to VAPI
-    transfer_params = {
-        'value': 'BLIND_TRANSFER',
-        'phone_number': VICIDIAL_CONFIG['vapi_phone'],
-        'dial_override': 'YES'
-    }
-
-    if data.get('auto_login'):
-        session = get_vicidial_session('call-vapi')
-        transfer_response, _ = session.api_request('transfer_conference', transfer_params)
-    else:
-        transfer_params['function'] = 'transfer_conference'
-        transfer_response, _ = vicidial_request('agent', transfer_params)
-
-    transfer_result = parse_vicidial_response(transfer_response)
-    steps.append({'step': 'transfer', **transfer_result})
-
-    return jsonify({
-        'success': transfer_result.get('success', False),
-        'steps': steps
-    }), 200 if transfer_result.get('success') else 400
-
-
 # ============================================================
 # GENERIC CRM API RELAY (for any endpoint)
 # ============================================================
@@ -1752,7 +1268,7 @@ def home():
     """Home endpoint with API info"""
     return jsonify({
         "name": "BioGenetics API Relay Server",
-        "version": "1.7",
+        "version": "1.8",
         "endpoints": {
             "health": "GET /health",
             "emdeon_token": "POST /relay/emdeon/token",
@@ -1771,23 +1287,16 @@ def home():
             "vicidial_add_lead": "POST /relay/vicidial/add-lead (triggers auto-dial)",
             "vicidial_delete_lead": "POST /relay/vicidial/delete-lead (by lead_id or phone)",
             "vicidial_lead_info": "POST /relay/vicidial/lead-info (get lead by phone)",
-            "vicidial_login": "POST /relay/vicidial/login (auto-login agent)",
-            "vicidial_logout": "POST /relay/vicidial/logout (clear session)",
-            "vicidial_agent_status": "POST /relay/vicidial/agent-status",
-            "vicidial_dial": "POST /relay/vicidial/dial (phone_number or lead_id)",
-            "vicidial_transfer": "POST /relay/vicidial/transfer (to VAPI or other)",
-            "vicidial_transfer_to_agent": "POST /relay/vicidial/transfer-to-agent (LOCAL_CLOSER to INTERNAL_TRANSFER)",
-            "vicidial_hangup": "POST /relay/vicidial/hangup",
-            "vicidial_disposition": "POST /relay/vicidial/disposition (status code)",
-            "vicidial_pause": "POST /relay/vicidial/pause (PAUSE or RESUME)",
-            "vicidial_call_vapi": "POST /relay/vicidial/call-vapi (auto-login + dial + transfer)"
+            "vicidial_update_lead": "POST /relay/vicidial/update-lead (update lead status)",
+            "vicidial_transfer_to_agent": "POST /relay/vicidial/transfer-to-agent (transfer to live agent)",
+            "vicidial_disposition": "POST /relay/vicidial/disposition (set call disposition)"
         }
     })
 
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("  BioGenetics API Relay Server v1.7")
+    print("  BioGenetics API Relay Server v1.8")
     print("=" * 50)
     print(f"\nRelay API Key: {RELAY_API_KEY}")
     print("\nStarting server on http://0.0.0.0:5001")
