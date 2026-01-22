@@ -632,7 +632,7 @@ def vicidial_request(api_type, params):
         params: dict of query parameters
     """
     base_params = {
-        'source': 'API',
+        'source': 'AIAgent',
         'user': VICIDIAL_CONFIG['user'],
         'pass': VICIDIAL_CONFIG['pass'],
         'agent_user': VICIDIAL_CONFIG['agent_user']
@@ -680,34 +680,38 @@ def parse_vicidial_response(response_text):
 
 @app.route('/relay/vicidial/transfer-to-agent', methods=['POST'])
 def relay_vicidial_transfer_to_agent():
-    """Transfer call to a live VICIdial agent using INTERNAL_TRANSFER in-group
+    """Transfer call to a live VICIdial agent using Remote Agent API (ra_call_control)
 
     This endpoint is used by VAPI to transfer qualified patients back to a
-    human sales agent. It uses the LOCAL_CLOSER method with the INTERNAL_TRANSFER
-    in-group configured in VICIdial.
+    human sales agent. It uses the ra_call_control function for Remote Agents.
+
+    Flow:
+    1. Call agent_status to get the callerid (Call ID)
+    2. Call ra_call_control with INGROUPTRANSFER to transfer the call
 
     Request body:
     {
         "destination": "sales",           // optional, for logging/routing context
-        "ingroup": "INTERNAL_TRANSFER"    // optional, defaults to INTERNAL_TRANSFER
+        "ingroup": "DEFAULTINGROUP",      // optional, defaults to DEFAULTINGROUP
+        "status": "SALE"                  // optional, disposition code (default: SALE)
     }
 
     Response:
     {
         "success": true,
-        "message": "SUCCESS: transfer_conference function set..."
+        "message": "SUCCESS: ra_call_control transferred - ...",
+        "callerid": "V1210112040011081852"
     }
 
     Error Response:
     {
         "success": false,
-        "error": "ERROR: agent_user does not have a live call..."
+        "error": "ERROR: no active call found..."
     }
 
     Notes:
-    - Agent must be logged in and have a live call for transfer to work
-    - The INTERNAL_TRANSFER in-group must be configured in VICIdial campaign
-    - Uses LOCAL_CLOSER to route to available agents in the same campaign
+    - Agent must have an active call (status=INCALL) for transfer to work
+    - Uses ra_call_control with stage=INGROUPTRANSFER for Remote Agent transfers
     """
     auth_header = request.headers.get('X-Relay-Key')
     if auth_header != RELAY_API_KEY:
@@ -716,27 +720,88 @@ def relay_vicidial_transfer_to_agent():
     data = request.get_json() or {}
 
     destination = data.get('destination', 'sales')
-    ingroup = data.get('ingroup', 'INTERNAL_TRANSFER')
+    ingroup = data.get('ingroup', 'DEFAULTINGROUP')
+    status = data.get('status', 'SALE')
 
     # Log request
-    print(f"[VICIdial Transfer to Agent] Destination: {destination} | In-Group: {ingroup}")
+    print(f"[VICIdial Transfer to Agent] Destination: {destination} | In-Group: {ingroup} | Status: {status}")
 
-    params = {
-        'function': 'transfer_conference',
-        'value': 'LOCAL_CLOSER',
-        'ingroup_choices': ingroup
+    import time
+
+    # Step 1: Get agent status to retrieve callerid
+    print(f"[VICIdial Transfer to Agent] Step 1: Getting agent status...")
+    status_params = {
+        'function': 'agent_status',
+        'stage': 'pipe',
+        'header': 'YES'
+    }
+    status_response, status_code = vicidial_request('non_agent', status_params)
+    print(f"[VICIdial Transfer to Agent] Agent status response: {status_response[:200]}")
+
+    # Parse agent_status response to get callerid
+    # Format: status|callerid|lead_id|campaign_id|...
+    callerid = None
+    agent_status = None
+
+    lines = status_response.strip().split('\n')
+    if len(lines) >= 2:
+        # First line is header, second line is data
+        headers = lines[0].split('|')
+        values = lines[1].split('|')
+
+        if len(headers) == len(values):
+            status_data = dict(zip(headers, values))
+            agent_status = status_data.get('status')
+            callerid = status_data.get('callerid')
+            print(f"[VICIdial Transfer to Agent] Agent status: {agent_status} | Caller ID: {callerid}")
+
+    # Check if agent is on a call
+    if agent_status != 'INCALL':
+        print(f"[VICIdial Transfer to Agent] Agent not on a call. Status: {agent_status}")
+        return jsonify({
+            'success': False,
+            'error': f'Agent is not on a call. Current status: {agent_status}',
+            'agent_status': agent_status,
+            'sabrina_action': 'TRANSFER_FAILED',
+            'sabrina_message': 'No active call to transfer.',
+            'disposition_code': 'CALLBK'
+        }), 400
+
+    if not callerid:
+        print(f"[VICIdial Transfer to Agent] No callerid found in agent_status response")
+        return jsonify({
+            'success': False,
+            'error': 'Could not retrieve call ID from agent status',
+            'raw_response': status_response[:500],
+            'sabrina_action': 'TRANSFER_FAILED',
+            'sabrina_message': 'Could not identify the active call.',
+            'disposition_code': 'CALLBK'
+        }), 400
+
+    # Step 2: Call ra_call_control to transfer the call
+    print(f"[VICIdial Transfer to Agent] Step 2: Transferring call {callerid}...")
+
+    transfer_params = {
+        'function': 'ra_call_control',
+        'stage': 'INGROUPTRANSFER',
+        'value': callerid,
+        'ingroup_choices': ingroup,
+        'status': status
     }
 
     # Try transfer with 1 retry per John's email
-    import time
     for attempt in range(2):
-        response_text, status_code = vicidial_request('agent', params)
+        response_text, resp_status_code = vicidial_request('agent', transfer_params)
+        print(f"[VICIdial Transfer to Agent] Transfer response (attempt {attempt + 1}): {response_text}")
+
         result = parse_vicidial_response(response_text)
 
-        # Success - HTTP 200 OK is the only good response per John
-        if result.get('success') and status_code == 200:
+        # Success - check for "SUCCESS: ra_call_control transferred"
+        if result.get('success') and 'transferred' in response_text.lower():
             result['destination'] = destination
             result['ingroup'] = ingroup
+            result['callerid'] = callerid
+            result['status'] = status
             result['retry_attempted'] = (attempt > 0)
             print(f"[VICIdial Transfer to Agent] Success on attempt {attempt + 1}")
             return jsonify(result), 200
@@ -751,6 +816,7 @@ def relay_vicidial_transfer_to_agent():
         print(f"[VICIdial Transfer to Agent] Transfer failed after retry")
         result['destination'] = destination
         result['ingroup'] = ingroup
+        result['callerid'] = callerid
         result['retry_attempted'] = True
         result['sabrina_action'] = 'TRANSFER_FAILED'
         result['sabrina_message'] = 'Transfer to agent failed. Inform patient system is down and we will call them back.'
@@ -763,11 +829,158 @@ def relay_vicidial_transfer_to_agent():
         'error': 'Transfer failed',
         'destination': destination,
         'ingroup': ingroup,
+        'callerid': callerid,
         'retry_attempted': True,
         'sabrina_action': 'TRANSFER_FAILED',
         'sabrina_message': 'Transfer to agent failed. Inform patient system is down and we will call them back.',
         'disposition_code': 'CALLBK'
     }), 500
+
+
+@app.route('/relay/vicidial/agent-status', methods=['POST'])
+def relay_vicidial_agent_status():
+    """Get VICIdial agent status and caller ID
+
+    This endpoint retrieves the current status of the remote agent,
+    including the callerid needed for ra_call_control operations.
+
+    Request body: {} (empty)
+
+    Response:
+    {
+        "success": true,
+        "status": "INCALL",
+        "callerid": "V1210112040011081852",
+        "lead_id": "12345",
+        "campaign_id": "TESTCAMP",
+        "phone_number": "7275551212"
+    }
+    """
+    auth_header = request.headers.get('X-Relay-Key')
+    if auth_header != RELAY_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    print(f"[VICIdial Agent Status] Getting agent status...")
+
+    params = {
+        'function': 'agent_status',
+        'stage': 'pipe',
+        'header': 'YES'
+    }
+
+    response_text, status_code = vicidial_request('non_agent', params)
+    print(f"[VICIdial Agent Status] Response: {response_text[:300]}")
+
+    # Parse pipe-separated response with header
+    lines = response_text.strip().split('\n')
+    if len(lines) >= 2:
+        headers = lines[0].split('|')
+        values = lines[1].split('|')
+
+        if len(headers) == len(values):
+            result = dict(zip(headers, values))
+            result['success'] = True
+            return jsonify(result), 200
+
+    # Fallback for unexpected format
+    return jsonify({
+        'success': True,
+        'raw': response_text
+    }), 200
+
+
+@app.route('/relay/vicidial/hangup', methods=['POST'])
+def relay_vicidial_hangup():
+    """Hangup call and set disposition using Remote Agent API (ra_call_control)
+
+    This endpoint hangs up the active call and sets disposition.
+    Uses ra_call_control with stage=HANGUP for Remote Agents.
+
+    Flow:
+    1. Call agent_status to get the callerid (Call ID)
+    2. Call ra_call_control with HANGUP to end the call
+
+    Request body:
+    {
+        "status": "NQI"    // required - disposition code (DNC, NQI, NI, CALLBK, etc.)
+    }
+
+    Response:
+    {
+        "success": true,
+        "message": "SUCCESS: ra_call_control hungup - ...",
+        "callerid": "V1210112040011081852"
+    }
+    """
+    auth_header = request.headers.get('X-Relay-Key')
+    if auth_header != RELAY_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json() or {}
+
+    status = data.get('status')
+    if not status:
+        return jsonify({"error": "status (disposition code) is required"}), 400
+
+    print(f"[VICIdial Hangup] Hanging up call with status: {status}")
+
+    import time
+
+    # Step 1: Get agent status to retrieve callerid
+    print(f"[VICIdial Hangup] Step 1: Getting agent status...")
+    status_params = {
+        'function': 'agent_status',
+        'stage': 'pipe',
+        'header': 'YES'
+    }
+    status_response, status_code = vicidial_request('non_agent', status_params)
+
+    # Parse agent_status response to get callerid
+    callerid = None
+    agent_status = None
+
+    lines = status_response.strip().split('\n')
+    if len(lines) >= 2:
+        headers = lines[0].split('|')
+        values = lines[1].split('|')
+
+        if len(headers) == len(values):
+            status_data = dict(zip(headers, values))
+            agent_status = status_data.get('status')
+            callerid = status_data.get('callerid')
+            print(f"[VICIdial Hangup] Agent status: {agent_status} | Caller ID: {callerid}")
+
+    if not callerid:
+        print(f"[VICIdial Hangup] No active call to hangup")
+        return jsonify({
+            'success': False,
+            'error': 'No active call to hangup',
+            'agent_status': agent_status
+        }), 400
+
+    # Step 2: Call ra_call_control to hangup the call
+    print(f"[VICIdial Hangup] Step 2: Hanging up call {callerid}...")
+
+    hangup_params = {
+        'function': 'ra_call_control',
+        'stage': 'HANGUP',
+        'value': callerid,
+        'status': status
+    }
+
+    response_text, resp_status_code = vicidial_request('agent', hangup_params)
+    print(f"[VICIdial Hangup] Response: {response_text}")
+
+    result = parse_vicidial_response(response_text)
+
+    if result.get('success') and 'hungup' in response_text.lower():
+        result['callerid'] = callerid
+        result['status'] = status
+        return jsonify(result), 200
+
+    result['callerid'] = callerid
+    result['status'] = status
+    return jsonify(result), 400 if not result.get('success') else 200
 
 
 @app.route('/relay/vicidial/disposition', methods=['POST'])
@@ -1268,7 +1481,7 @@ def home():
     """Home endpoint with API info"""
     return jsonify({
         "name": "BioGenetics API Relay Server",
-        "version": "1.8",
+        "version": "1.9",
         "endpoints": {
             "health": "GET /health",
             "emdeon_token": "POST /relay/emdeon/token",
@@ -1288,7 +1501,9 @@ def home():
             "vicidial_delete_lead": "POST /relay/vicidial/delete-lead (by lead_id or phone)",
             "vicidial_lead_info": "POST /relay/vicidial/lead-info (get lead by phone)",
             "vicidial_update_lead": "POST /relay/vicidial/update-lead (update lead status)",
-            "vicidial_transfer_to_agent": "POST /relay/vicidial/transfer-to-agent (transfer to live agent)",
+            "vicidial_agent_status": "POST /relay/vicidial/agent-status (get agent status + callerid)",
+            "vicidial_transfer_to_agent": "POST /relay/vicidial/transfer-to-agent (ra_call_control INGROUPTRANSFER)",
+            "vicidial_hangup": "POST /relay/vicidial/hangup (ra_call_control HANGUP with disposition)",
             "vicidial_disposition": "POST /relay/vicidial/disposition (set call disposition)"
         }
     })
@@ -1296,7 +1511,7 @@ def home():
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("  BioGenetics API Relay Server v1.8")
+    print("  BioGenetics API Relay Server v1.9")
     print("=" * 50)
     print(f"\nRelay API Key: {RELAY_API_KEY}")
     print("\nStarting server on http://0.0.0.0:5001")
